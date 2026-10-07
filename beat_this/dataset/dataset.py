@@ -2,6 +2,7 @@ import concurrent.futures
 import itertools
 import json
 import re
+
 from pathlib import Path
 
 import numpy as np
@@ -61,6 +62,11 @@ class BeatTrackingDataset(Dataset):
         with concurrent.futures.ThreadPoolExecutor() as executor:
             items = executor.map(self._load_dataset_item, item_names)
         items = [item for item in items if item is not None]
+
+        # # TODO filter
+        # if filter_on_four_four:
+        #     items = [item for item in items if self.get_signature(item)==4]
+
         if self.length_based_oversampling_factor and self.train_length is not None:
             # oversample the dataset according to the audio lengths, so that long pieces are sampled more often
             oversampled_items = []

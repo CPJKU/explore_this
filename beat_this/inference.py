@@ -5,8 +5,11 @@ import soxr
 import torch
 import torch.nn.functional as F
 
-from beat_this.model.beat_tracker import BeatThis
-from beat_this.model.postprocessor import Postprocessor
+from beat_this.model.beat_tracker import BeatThis, ModelOutput
+
+# from beat_this.model.postprocessor import Postprocessor
+from beat_this.model.grid import GridOutput
+from beat_this.model.subgrid import SubgridOutput
 from beat_this.preprocessing import LogMelSpect, load_audio
 from beat_this.utils import replace_state_dict_key, save_beat_tsv
 
@@ -26,7 +29,7 @@ def load_checkpoint(checkpoint_path: str, device: str | torch.device = "cpu") ->
     """
     try:
         # try interpreting as local file name
-        weights_only = {"weights_only": True} if torch.__version__ >= "2" else {}
+        weights_only = {"weights_only": False} if torch.__version__ >= "2" else {}
         return torch.load(checkpoint_path, map_location=device, **weights_only)
     except FileNotFoundError:
         try:
@@ -100,7 +103,7 @@ def zeropad(spect: torch.Tensor, left: int = 0, right: int = 0):
 def split_piece(
     spect: torch.Tensor,
     chunk_size: int,
-    border_size: int = 6,
+    border_size: int = 0,
     avoid_short_end: bool = True,
 ):
     """
@@ -124,6 +127,7 @@ def split_piece(
         # if we avoid short ends, move the last index to the end of the piece - (chunk_size - border_size)
         starts[-1] = len(spect) - (chunk_size - border_size)
     # generate the chunks
+
     chunks = [
         zeropad(
             spect[max(start, 0) : min(start + chunk_size, len(spect))],
@@ -132,66 +136,45 @@ def split_piece(
         )
         for start in starts
     ]
+
+    if chunks[-1].shape[0] < chunk_size:
+        chunks[-1] = zeropad(chunks[-1], right=chunk_size - chunks[-1].shape[0])
+
     return chunks, starts
 
 
-def aggregate_prediction(
-    pred_chunks: list,
-    starts: list,
+def aggregate_tensor(
+    chunks: list[torch.Tensor],
+    starts,
     full_size: int,
     chunk_size: int,
-    border_size: int,
-    overlap_mode: str,
     device: str | torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Aggregates the predictions for the whole piece based on the given prediction chunks.
+    overlap_mode: str = "keep_last",
+) -> torch.Tensor:
+    res = torch.zeros(
+        size=(max(chunk_size, full_size), *chunks[0].shape[1:]),
+        device=device,
+        dtype=chunks[0].dtype,
+    )
 
-    Args:
-        pred_chunks (list): List of prediction chunks, where each chunk is a dictionary containing 'beat' and 'downbeat' predictions.
-        starts (list): List of start positions for each prediction chunk.
-        full_size (int): Size of the full piece.
-        chunk_size (int): Size of each prediction chunk.
-        border_size (int): Size of the border to be discarded from each prediction chunk.
-        overlap_mode (str): Mode for handling overlapping predictions. Can be 'keep_first' or 'keep_last'.
-        device (torch.device): Device to be used for the predictions.
-
-    Returns:
-        tuple: A tuple containing the aggregated beat predictions and downbeat predictions as torch tensors for the whole piece.
-    """
-    if border_size > 0:
-        # cut the predictions to discard the border
-        pred_chunks = [
-            {
-                "beat": pchunk["beat"][border_size:-border_size],
-                "downbeat": pchunk["downbeat"][border_size:-border_size],
-            }
-            for pchunk in pred_chunks
-        ]
-    # aggregate the predictions for the whole piece
-    piece_prediction_beat = torch.full((full_size,), -1000.0, device=device)
-    piece_prediction_downbeat = torch.full((full_size,), -1000.0, device=device)
     if overlap_mode == "keep_first":
         # process in reverse order, so predictions of earlier excerpts overwrite later ones
-        pred_chunks = reversed(list(pred_chunks))
+        chunks = reversed(list(chunks))  # type: ignore
         starts = reversed(list(starts))
-    for start, pchunk in zip(starts, pred_chunks):
-        piece_prediction_beat[
-            start + border_size : start + chunk_size - border_size
-        ] = pchunk["beat"]
-        piece_prediction_downbeat[
-            start + border_size : start + chunk_size - border_size
-        ] = pchunk["downbeat"]
-    return piece_prediction_beat, piece_prediction_downbeat
+
+    for start, chunk in zip(starts, chunks):
+        res[start : start + chunk_size] = chunk
+
+    return res[:full_size]
 
 
 def split_predict_aggregate(
     spect: torch.Tensor,
     chunk_size: int,
-    border_size: int,
     overlap_mode: str,
-    model: torch.nn.Module,
-) -> dict:
+    model: BeatThis,
+    end_goal: str = "subgrid",  # grid or subgrid
+) -> ModelOutput:
     """
     Function for pieces that are longer than the training length of the model.
     Split the input piece into chunks, run the model on them, and aggregate the predictions.
@@ -208,108 +191,142 @@ def split_predict_aggregate(
         dict: the model framewise predictions for the hole piece as a dictionary containing 'beat' and 'downbeat' predictions.
     """
     # split the piece into chunks
-    chunks, starts = split_piece(
-        spect, chunk_size, border_size=border_size, avoid_short_end=True
-    )
-    # run the model
-    pred_chunks = [model(chunk.unsqueeze(0)) for chunk in chunks]
-    # remove the extra dimension in beat and downbeat prediction due to batch size 1
-    pred_chunks = [
-        {"beat": p["beat"][0], "downbeat": p["downbeat"][0]} for p in pred_chunks
+    chunks, starts = split_piece(spect, chunk_size, border_size=0, avoid_short_end=True)
+
+    if end_goal == "grid":
+        # run the model
+        pred_grid_chunks: list[GridOutput] = [
+            model.grid_forward(model.pre_grid_forward(chunk.unsqueeze(0).float()))[
+                0
+            ].squeeze(0)
+            for chunk in chunks
+        ]
+
+        g_mask: torch.Tensor = aggregate_tensor(
+            chunks=[p.mask for p in pred_grid_chunks],
+            starts=starts,  # type: ignore
+            full_size=spect.shape[0],
+            chunk_size=chunk_size,
+            device=spect.device,
+            overlap_mode=overlap_mode,
+        )
+        return ModelOutput(
+            grid_features=None,  # type: ignore
+            grid_activations=None,  # type: ignore
+            grid_mask=g_mask,
+            subgrid_features=None,
+            beat_activation=None,
+            beat_mask=None,
+            downbeat_activation=None,
+            downbeat_mask=None,
+        )
+
+    pred_chunks: list[ModelOutput] = [
+        model.forward(chunk.unsqueeze(0).float()).squeeze(0) for chunk in chunks
     ]
-    piece_prediction_beat, piece_prediction_downbeat = aggregate_prediction(
-        pred_chunks,
-        starts,
-        spect.shape[0],
-        chunk_size,
-        border_size,
-        overlap_mode,
-        spect.device,
+
+    def aggregate(x):
+        return aggregate_tensor(
+            chunks=[getattr(p, x) for p in pred_chunks],  # type: ignore
+            starts=starts,  # type: ignore
+            full_size=spect.shape[0],
+            chunk_size=chunk_size,
+            device=spect.device,
+            overlap_mode=overlap_mode,
+        )
+
+    return ModelOutput(
+        grid_features=None,  # type: ignore
+        grid_activations=None,  # type: ignore
+        grid_mask=aggregate("grid_mask"),
+        subgrid_features=None,  # type: ignore
+        beat_activation=aggregate("beat_activation"),
+        beat_mask=aggregate("beat_mask"),
+        downbeat_activation=aggregate("downbeat_activation"),
+        downbeat_mask=aggregate("downbeat_mask"),
     )
-    # save it to model_prediction
-    return {"beat": piece_prediction_beat, "downbeat": piece_prediction_downbeat}
 
 
-class Spect2Frames:
-    """
-    Class for extracting framewise beat and downbeat predictions (logits) from a spectrogram.
-    """
+# class Spect2Frames:
+#     """
+#     Class for extracting framewise beat and downbeat predictions (logits) from a spectrogram.
+#     """
 
-    def __init__(self, checkpoint_path="final0", device="cpu", float16=False):
-        super().__init__()
-        self.device = torch.device(device)
-        self.float16 = float16
-        self.model = load_model(checkpoint_path, self.device)
+#     def __init__(self, checkpoint_path="final0", device="cpu", float16=False):
+#         super().__init__()
+#         self.device = torch.device(device)
+#         self.float16 = float16
+#         self.model = load_model(checkpoint_path, self.device)
 
-    def spect2frames(self, spect):
-        with torch.inference_mode():
-            with torch.autocast(enabled=self.float16, device_type=self.device.type):
-                model_prediction = split_predict_aggregate(
-                    spect=spect,
-                    chunk_size=1500,
-                    overlap_mode="keep_first",
-                    border_size=6,
-                    model=self.model,
-                )
-        return model_prediction["beat"].float(), model_prediction["downbeat"].float()
+#     def spect2frames(self, spect):
+#         with torch.inference_mode():
+#             with torch.autocast(enabled=self.float16, device_type=self.device.type):
+#                 model_prediction = split_predict_aggregate(
+#                     spect=spect,
+#                     chunk_size=1500,
+#                     overlap_mode="keep_first",
+#                     # border_size=6,
+#                     model=self.model,
+#                 )
+#         return model_prediction["beat"].float(), model_prediction["downbeat"].float()
 
-    def __call__(self, spect):
-        return self.spect2frames(spect)
-
-
-class Audio2Frames(Spect2Frames):
-    """
-    Class for extracting framewise beat and downbeat predictions (logits) from an audio tensor.
-    """
-
-    def __init__(self, checkpoint_path="final0", device="cpu", float16=False):
-        super().__init__(checkpoint_path, device, float16)
-        self.spect = LogMelSpect(device=self.device)
-
-    def signal2spect(self, signal, sr):
-        if signal.ndim == 2:
-            signal = signal.mean(1)
-        elif signal.ndim != 1:
-            raise ValueError(f"Expected 1D or 2D signal, got shape {signal.shape}")
-        if sr != 22050:
-            signal = soxr.resample(signal, in_rate=sr, out_rate=22050)
-        signal = torch.tensor(signal, dtype=torch.float32, device=self.device)
-        return self.spect(signal)
-
-    def __call__(self, signal, sr):
-        spect = self.signal2spect(signal, sr)
-        return self.spect2frames(spect)
+#     def __call__(self, spect):
+#         return self.spect2frames(spect)
 
 
-class Audio2Beats(Audio2Frames):
-    """
-    Class for extracting beat and downbeat positions (in seconds) from an audio tensor.
+# class Audio2Frames(Spect2Frames):
+#     """
+#     Class for extracting framewise beat and downbeat predictions (logits) from an audio tensor.
+#     """
 
-    Args:
-        checkpoint_path (str): Path to the model checkpoint file. It can be a local path, a URL, or a key from the CHECKPOINT_URL dictionary. Default is "final0", which will load the model trained on all data except GTZAN with seed 0.
-        device (str): Device to use for inference. Default is "cpu".
-        float16 (bool): Whether to use half precision floating point arithmetic. Default is False.
-        dbn (bool): Whether to use the madmom DBN for post-processing. Default is False.
-    """
+#     def __init__(self, checkpoint_path="final0", device="cpu", float16=False):
+#         super().__init__(checkpoint_path, device, float16)
+#         self.spect = LogMelSpect(device=self.device)
 
-    def __init__(
-        self, checkpoint_path="final0", device="cpu", float16=False, dbn=False
-    ):
-        super().__init__(checkpoint_path, device, float16)
-        self.frames2beats = Postprocessor(type="dbn" if dbn else "minimal")
+#     def signal2spect(self, signal, sr):
+#         if signal.ndim == 2:
+#             signal = signal.mean(1)
+#         elif signal.ndim != 1:
+#             raise ValueError(f"Expected 1D or 2D signal, got shape {signal.shape}")
+#         if sr != 22050:
+#             signal = soxr.resample(signal, in_rate=sr, out_rate=22050)
+#         signal = torch.tensor(signal, dtype=torch.float32, device=self.device)
+#         return self.spect(signal)
 
-    def __call__(self, signal, sr):
-        beat_logits, downbeat_logits = super().__call__(signal, sr)
-        return self.frames2beats(beat_logits, downbeat_logits)
-
-
-class File2Beats(Audio2Beats):
-    def __call__(self, audio_path):
-        signal, sr = load_audio(audio_path)
-        return super().__call__(signal, sr)
+#     def __call__(self, signal, sr):
+#         spect = self.signal2spect(signal, sr)
+#         return self.spect2frames(spect)
 
 
-class File2File(File2Beats):
-    def __call__(self, audio_path, output_path):
-        downbeats, beats = super().__call__(audio_path)
-        save_beat_tsv(downbeats, beats, output_path)
+# class Audio2Beats(Audio2Frames):
+#     """
+#     Class for extracting beat and downbeat positions (in seconds) from an audio tensor.
+
+#     Args:
+#         checkpoint_path (str): Path to the model checkpoint file. It can be a local path, a URL, or a key from the CHECKPOINT_URL dictionary. Default is "final0", which will load the model trained on all data except GTZAN with seed 0.
+#         device (str): Device to use for inference. Default is "cpu".
+#         float16 (bool): Whether to use half precision floating point arithmetic. Default is False.
+#         dbn (bool): Whether to use the madmom DBN for post-processing. Default is False.
+#     """
+
+#     def __init__(
+#         self, checkpoint_path="final0", device="cpu", float16=False, dbn=False
+#     ):
+#         super().__init__(checkpoint_path, device, float16)
+#         self.frames2beats = Postprocessor(type="dbn" if dbn else "minimal")
+
+#     def __call__(self, signal, sr):
+#         beat_logits, downbeat_logits = super().__call__(signal, sr)
+#         return self.frames2beats(beat_logits, downbeat_logits)
+
+
+# class File2Beats(Audio2Beats):
+#     def __call__(self, audio_path):
+#         signal, sr = load_audio(audio_path)
+#         return super().__call__(signal, sr)
+
+
+# class File2File(File2Beats):
+#     def __call__(self, audio_path, output_path):
+#         downbeats, beats = super().__call__(audio_path)
+#         save_beat_tsv(downbeats, beats, output_path)

@@ -6,21 +6,31 @@ optimizers for training.
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-import mir_eval
 import numpy as np
 import torch
 from pytorch_lightning import LightningModule
 
-import beat_this.model.loss
+from beat_this.model.grid import (
+    WindowedGridRegularizationLoss,
+    RecallLoss,
+    LowProbLoss,
+)
+
+import beat_this.metrics as metrics
+
 from beat_this.inference import split_predict_aggregate
-from beat_this.model.beat_tracker import BeatThis
-from beat_this.model.postprocessor import Postprocessor
+from beat_this.model.beat_tracker import BeatThis, ModelOutput
+from beat_this.model.subgrid import (
+    BeatSubgridPredictionLoss,
+    BeatSubgridRegularizationLoss,
+)
 from beat_this.utils import replace_state_dict_key
 
 
 class PLBeatThis(LightningModule):
     def __init__(
         self,
+        training_type: str,  # ["full", "grid", "subgrid"]
         spect_dim=128,
         fps=50,
         transformer_dim=512,
@@ -30,22 +40,38 @@ class PLBeatThis(LightningModule):
         dropout={"frontend": 0.1, "transformer": 0.2},
         lr=0.0008,
         weight_decay=0.01,
-        pos_weights={"beat": 1, "downbeat": 1},
+        # pos_weights={"beat": 1, "downbeat": 1},
         head_dim=32,
-        loss_type="shift_tolerant_weighted_bce",
+        # loss_type="shift_tolerant_weighted_bce",
         warmup_steps=1000,
         max_epochs=100,
-        use_dbn=False,
         eval_trim_beats=5,
-        sum_head=True,
         partial_transformers=True,
+        grid_regularization_weight=0.1,
+        grid_regularization_freq_scale=0.002,
+        grid_regularization_phase_factor=2,
+        grid_confidence_loss_weight=1e-5,
+        grid_window_size: int = 50,
+        grid_half_crossfade_frames: int = 5,
+        grid_min_freq: float = 0.01,
+        grid_bins_per_octave: int = 3,
+        grid_consistensy_prob_spread: float = 0.05,
+        grid_pred_prob_spread: float = 0.05,
+        grid_downbeat_weight: float = 1,
+        subgrid_transformer_layers: int = 3,
+        max_subgrid_meter: int = 4,
+        max_subgrid_downbeat_meter: int = 15,
+        subgrid_regularization_scale=1e-2,
+        subgrid_loss_scale=1.0,
     ):
         super().__init__()
         self.save_hyperparameters()
+        self.training_type = training_type
         self.lr = lr
         self.weight_decay = weight_decay
         self.fps = fps
         # create model
+
         self.model = BeatThis(
             spect_dim=spect_dim,
             transformer_dim=transformer_dim,
@@ -54,142 +80,218 @@ class PLBeatThis(LightningModule):
             n_layers=n_layers,
             head_dim=head_dim,
             dropout=dropout,
-            sum_head=sum_head,
             partial_transformers=partial_transformers,
+            grid_window_size=grid_window_size,
+            grid_min_freq=grid_min_freq,
+            grid_bins_per_octave=grid_bins_per_octave,
+            grid_pred_prob_spread=grid_pred_prob_spread,
+            grid_half_crossfade_frames=grid_half_crossfade_frames,
+            use_subgrid=training_type != "grid",
+            subgrid_transformer_layers=subgrid_transformer_layers,
+            max_subgrid_meter=max_subgrid_meter,
+            max_subgrid_downbeat_meter=max_subgrid_downbeat_meter,
         )
+
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
-        # set up the losses
-        self.pos_weights = pos_weights
-        if loss_type == "shift_tolerant_weighted_bce":
-            self.beat_loss = beat_this.model.loss.ShiftTolerantBCELoss(
-                pos_weight=pos_weights["beat"]
-            )
-            self.downbeat_loss = beat_this.model.loss.ShiftTolerantBCELoss(
-                pos_weight=pos_weights["downbeat"]
-            )
-        elif loss_type == "weighted_bce":
-            self.beat_loss = beat_this.model.loss.MaskedBCELoss(
-                pos_weight=pos_weights["beat"]
-            )
-            self.downbeat_loss = beat_this.model.loss.MaskedBCELoss(
-                pos_weight=pos_weights["downbeat"]
-            )
-        elif loss_type == "bce":
-            self.beat_loss = beat_this.model.loss.MaskedBCELoss()
-            self.downbeat_loss = beat_this.model.loss.MaskedBCELoss()
-        elif loss_type == "splitted_shift_tolerant_weighted_bce":
-            self.beat_loss = beat_this.model.loss.SplittedShiftTolerantBCELoss(
-                pos_weight=pos_weights["beat"]
-            )
-            self.downbeat_loss = beat_this.model.loss.SplittedShiftTolerantBCELoss(
-                pos_weight=pos_weights["downbeat"]
-            )
-        else:
-            raise ValueError(
-                "loss_type must be one of 'shift_tolerant_weighted_bce', 'weighted_bce', 'bce'"
+
+        grid_model = self.model.grid_processor
+
+        if self.training_type != "subgrid":
+            self.grid_recall_loss = RecallLoss(
+                downbeat_weight=grid_downbeat_weight,
             )
 
-        self.postprocessor = Postprocessor(
-            type="dbn" if use_dbn else "minimal", fps=fps
-        )
-        self.eval_trim_beats = eval_trim_beats
-        self.metrics = Metrics(eval_trim_beats=eval_trim_beats)
+            self.grid_reg_loss = WindowedGridRegularizationLoss(
+                grid_model=grid_model,
+                scale=grid_regularization_weight,
+                sinkhorn_max_iter=3,
+                frequency_log_step=grid_regularization_freq_scale,
+                phase_factor=grid_regularization_phase_factor,
+                max_pointwise_distance=2,
+                exponent=2,
+                probability_spread=grid_consistensy_prob_spread,
+            )
 
-    def _compute_loss(self, batch, model_prediction):
-        beat_mask = batch["padding_mask"]
-        beat_loss = self.beat_loss(
-            model_prediction["beat"], batch["truth_beat"].float(), beat_mask
-        )
-        # downbeat mask considers padding and also pieces which don't have downbeat annotations
-        downbeat_mask = beat_mask * batch["downbeat_mask"][:, None]
-        downbeat_loss = self.downbeat_loss(
-            model_prediction["downbeat"], batch["truth_downbeat"].float(), downbeat_mask
-        )
-        # sum the losses and return them in a dictionary for logging
-        return {
-            "beat": beat_loss,
-            "downbeat": downbeat_loss,
-            "total": beat_loss + downbeat_loss,
-        }
+            self.low_prob_loss = LowProbLoss(
+                grid_model=grid_model,
+                scale=grid_confidence_loss_weight,
+            )
 
-    def _compute_metrics(self, batch, postp_beat, postp_downbeat, step="val"):
-        """ """
-        # compute for beat
-        metrics_beat = self._compute_metrics_target(
-            batch, postp_beat, target="beat", step=step
-        )
-        # compute for downbeat
-        metrics_downbeat = self._compute_metrics_target(
-            batch, postp_downbeat, target="downbeat", step=step
+        if self.training_type != "grid":
+            self.subgrid_pred_loss = BeatSubgridPredictionLoss(
+                self.model.subgrid_processor
+            )
+            self.subgrid_consistensy_loss = BeatSubgridRegularizationLoss(
+                self.model.subgrid_processor,
+                scale=subgrid_regularization_scale,
+            )
+            self.subgrid_loss_scale = subgrid_loss_scale
+
+        # self.eval_trim_beats = eval_trim_beats
+
+    def load_base_model(self, base_model_path, load_subgrid=True):
+        try:
+            sd = torch.load(base_model_path)["state_dict"]
+        except FileNotFoundError:
+            print(f"Base model file not found: {base_model_path}")
+            return
+
+        if not load_subgrid:
+            sd = {k: v for k, v in sd.items() if "subgrid" not in k}
+
+        missing, unexpected = self.load_state_dict(sd, strict=False)
+        print(
+            "Unexpected keys when loading state dict for subgrid training:",
+            unexpected,
         )
 
-        # concatenate dictionaries
-        metrics = {**metrics_beat, **metrics_downbeat}
+    def _compute_loss(self, batch, model_prediction: ModelOutput) -> dict:
+        losses = {}
+        total_loss: torch.Tensor = 0  # type: ignore
+        if self.training_type != "subgrid":
+            reg_loss = self.grid_reg_loss.forward(model_prediction.grid_features)
+            low_prob_loss = self.low_prob_loss.forward(model_prediction.grid_features)
+            pred_loss = self.grid_recall_loss(
+                model_prediction.grid_activations,
+                batch["truth_beat"],
+                batch["truth_downbeat"],
+            )
+            grid_losses = {
+                "consistensy": reg_loss,
+                "certainty": low_prob_loss,
+                "total_regularization": reg_loss + low_prob_loss,
+                "pred": pred_loss,
+                "total": pred_loss + reg_loss + low_prob_loss,
+            }
 
-        return metrics
+            total_loss = total_loss + grid_losses["total"]
+            losses.update({f"grid_{k}": v for k, v in grid_losses.items()})
 
-    def _compute_metrics_target(self, batch, postp_target, target, step):
-
-        def compute_item(pospt_pred, truth_orig_target):
-            # take the ground truth from the original version, so there are no quantization errors
-            piece_truth_time = np.frombuffer(truth_orig_target)
-            # run evaluation
-            metrics = self.metrics(piece_truth_time, pospt_pred, step=step)
-
-            return metrics
-
-        # if the input was not batched, postp_target is an array instead of a tuple of arrays
-        # make it a tuple for consistency
-        if not isinstance(postp_target, tuple):
-            postp_target = (postp_target,)
-
-        with ThreadPoolExecutor() as executor:
-            piecewise_metrics = list(
-                executor.map(
-                    compute_item,
-                    postp_target,
-                    batch[f"truth_orig_{target}"],
+        if self.training_type != "grid":
+            pred_loss = (
+                self.subgrid_pred_loss.forward(
+                    model_prediction.beat_activation,
+                    model_prediction.downbeat_activation,
+                    model_prediction.grid_mask,
+                    batch["truth_beat"],
+                    batch["truth_downbeat"],
                 )
+                * self.subgrid_loss_scale
             )
 
-        # average the beat metrics across the dictionary
-        batch_metric = {
-            key + f"_{target}": np.mean([x[key] for x in piecewise_metrics])
-            for key in piecewise_metrics[0].keys()
-        }
+            consistensy_loss = (
+                self.subgrid_consistensy_loss.forward(
+                    model_prediction.subgrid_features, model_prediction.grid_mask
+                )
+                * self.subgrid_loss_scale
+            )
 
-        return batch_metric
+            subgrid_losses = {
+                "pred": pred_loss,
+                "consistensy": consistensy_loss,
+                "total": pred_loss + consistensy_loss,
+                # "total": pred_loss,
+            }
 
-    def log_losses(self, losses, batch_size, step="train"):
+            losses.update({f"subgrid_{k}": v for k, v in subgrid_losses.items()})
+            total_loss = total_loss + subgrid_losses["total"]
+
+        assert torch.isfinite(total_loss).item()
+
+        losses["total"] = total_loss
+        return losses
+
+    def _compute_metrics(
+        self, batch, model_prediction: ModelOutput, step="val"
+    ) -> dict[str, torch.Tensor]:
+        all_metrics: dict[str, torch.Tensor] = {}
+        if self.training_type != "subgrid":
+            grid_beat_recall = metrics.mask_recall(
+                model_prediction.grid_mask, batch["truth_beat"]
+            )
+
+            grid_downbeat_recall = metrics.mask_recall(
+                model_prediction.grid_mask, batch["truth_downbeat"]
+            )
+
+            grid_beat_f_measure = metrics.f_measure(
+                model_prediction.grid_mask, batch["truth_beat"]
+            )
+
+            grid_CMLc, grid_CMLt, grid_AMLc, grid_AMLt = metrics.continuity(
+                model_prediction.grid_mask, batch["truth_beat"]
+            )
+            grid_metrics = {
+                "recall": grid_beat_recall.mean(),
+                "downbeat_recall": grid_downbeat_recall.mean(),
+                "F-measure": grid_beat_f_measure.mean(),
+                "AMLt": np.mean(grid_AMLt),
+                "CMLt": np.mean(grid_CMLt),
+            }
+            all_metrics.update({f"grid_{k}": v for k, v in grid_metrics.items()})
+
+        if self.training_type != "grid":
+            bF_measure = metrics.f_measure(
+                model_prediction.beat_mask, batch["truth_beat"]
+            )
+            bRecall = metrics.mask_recall(
+                model_prediction.beat_mask, batch["truth_beat"]
+            )
+            bCMLc, bCMLt, bAMLc, bAMLt = metrics.continuity(
+                model_prediction.beat_mask, batch["truth_beat"]
+            )
+            dbF_measure = metrics.f_measure(
+                model_prediction.downbeat_mask, batch["truth_downbeat"]
+            )
+            dbRecall = metrics.mask_recall(
+                model_prediction.downbeat_mask, batch["truth_downbeat"]
+            )
+            dbCMLc, dbCMLt, dbAMLc, dbAMLt = metrics.continuity(
+                model_prediction.downbeat_mask, batch["truth_downbeat"]
+            )
+
+            subgrid_metrics = {
+                "bF-measure": bF_measure.mean(),
+                "bRecall": bRecall.mean(),
+                "bAMLt": np.mean(bAMLt),
+                "bCMLt": np.mean(bCMLt),
+                "dbF-measure": dbF_measure.mean(),
+                "dbRecall": dbRecall.mean(),
+                "dbAMLt": np.mean(dbAMLt),
+                "dbCMLt": np.mean(dbCMLt),
+            }
+            all_metrics.update({f"subgrid_{k}": v for k, v in subgrid_metrics.items()})
+        # concatenate dictionaries
+
+        return all_metrics
+
+    def log_losses(self, losses: dict[str, torch.Tensor], batch_size, step="train"):
         # log for separate targets
-        for target in "beat", "downbeat":
+        for target in losses.keys():
+            if target == "total":
+                prog_bar = True
+                name = f"{step}_loss"
+            else:
+                prog_bar = False
+                name = f"{step}_loss_{target}"
+
             self.log(
-                f"{step}_loss_{target}",
+                name,
                 losses[target].item(),
-                prog_bar=False,
+                prog_bar=prog_bar,
                 on_step=False,
                 on_epoch=True,
                 batch_size=batch_size,
                 sync_dist=True,
             )
-        # log total loss
-        self.log(
-            f"{step}_loss",
-            losses["total"].item(),
-            prog_bar=True,
-            on_step=False,
-            on_epoch=True,
-            batch_size=batch_size,
-            sync_dist=True,
-        )
 
     def log_metrics(self, metrics, batch_size, step="val"):
         for key, value in metrics.items():
             self.log(
                 f"{step}_{key}",
                 value,
-                prog_bar=key.startswith("F-measure"),
+                # prog_bar=key.startswith("F-measure"),
                 on_step=False,
                 on_epoch=True,
                 batch_size=batch_size,
@@ -197,8 +299,27 @@ class PLBeatThis(LightningModule):
             )
 
     def training_step(self, batch, batch_idx):
+
+        # DEBUGGING
+        # self.log(
+        #     "max subgrid parameter",
+        #     max([p.abs().amax() for p in self.model.subgrid_block.parameters()]),
+        #     prog_bar=True,
+        #     on_step=True,
+        # )
+        # self.log(
+        #     "sum of subgrid parameters",
+        #     sum([p.abs().sum() for p in self.model.subgrid_block.parameters()]),
+        #     prog_bar=True,
+        #     on_step=True,
+        # )
         # run the model
-        model_prediction = self.model(batch["spect"])
+        # The model only knows whether it should calculate the subgrid or not, not whether it has
+        # to detach the gradient. Therefore, we have to tell it here.
+        model_prediction: ModelOutput = self.model.forward(
+            batch["spect"], detach_pregrid=(self.training_type == "subgrid")
+        )
+
         # compute loss
         losses = self._compute_loss(batch, model_prediction)
         self.log_losses(losses, len(batch["spect"]), "train")
@@ -206,28 +327,21 @@ class PLBeatThis(LightningModule):
 
     def validation_step(self, batch, batch_idx):
         # run the model
-        model_prediction = self.model(batch["spect"])
+        model_prediction: ModelOutput = self.model.forward(batch["spect"])
         # compute loss
         losses = self._compute_loss(batch, model_prediction)
-        # postprocess the predictions
-        postp_beat, postp_downbeat = self.postprocessor(
-            model_prediction["beat"],
-            model_prediction["downbeat"],
-            batch["padding_mask"],
-        )
-        # compute the metrics
-        metrics = self._compute_metrics(batch, postp_beat, postp_downbeat, step="val")
-        # log
         self.log_losses(losses, len(batch["spect"]), "val")
+
+        # compute the metrics
+        metrics = self._compute_metrics(batch, model_prediction, "val")
+
         self.log_metrics(metrics, batch["spect"].shape[0], "val")
 
     def test_step(self, batch, batch_idx):
-        metrics, model_prediction, _, _ = self.predict_step(batch, batch_idx)
-        losses = self._compute_loss(batch, model_prediction)
-        # log
-        self.log_losses(losses, len(batch["spect"]), "test")
+        metrics, _, _, _ = self.predict_step(batch, batch_idx)
         self.log_metrics(metrics, batch["spect"].shape[0], "test")
 
+    # TODO predict step
     def predict_step(
         self,
         batch: Any,
@@ -254,43 +368,40 @@ class PLBeatThis(LightningModule):
             raise ValueError(
                 "When predicting full pieces, the Dataset must not pad inputs"
             )
-        # compute border size according to the loss type
-        if hasattr(
-            self.beat_loss, "tolerance"
-        ):  # discard the edges that are affected by the max-pooling in the loss
-            border_size = 2 * self.beat_loss.tolerance
-        else:
-            border_size = 0
-        model_prediction = split_predict_aggregate(
-            batch["spect"][0], chunk_size, border_size, overlap_mode, self.model
+
+        model_prediction: ModelOutput = split_predict_aggregate(
+            batch["spect"][0],
+            chunk_size,
+            overlap_mode,
+            self.model,
+            end_goal="grid" if self.training_type == "grid" else "subgrid",
         )
+
+        model_prediction = model_prediction.unsqueeze(0)
         # add the batch dimension back in the prediction for consistency
-        model_prediction = {
-            key: value.unsqueeze(0) for key, value in model_prediction.items()
-        }
-        # postprocess the predictions
-        postp_beat, postp_downbeat = self.postprocessor(
-            model_prediction["beat"], model_prediction["downbeat"], None
-        )
+
         # compute the metrics
-        metrics = self._compute_metrics(batch, postp_beat, postp_downbeat, step="test")
+        metrics = self._compute_metrics(batch, model_prediction, step="test")
         return metrics, model_prediction, batch["dataset"], batch["spect_path"]
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW
         # only decay 2+-dimensional tensors, to exclude biases and norms
         # (filtering on dimensionality idea taken from Kaparthy's nano-GPT)
+
+        # No need to check for grid because then the subgrid doesn't exist anyways.
+        if self.training_type == "subgrid":
+            params = [p for n, p in self.named_parameters() if "subgrid" in n]
+        else:
+            params = self.parameters()
+
         params = [
             {
-                "params": (
-                    p for p in self.parameters() if p.requires_grad and p.ndim >= 2
-                ),
+                "params": (p for p in params if p.requires_grad and p.ndim >= 2),
                 "weight_decay": self.weight_decay,
             },
             {
-                "params": (
-                    p for p in self.parameters() if p.requires_grad and p.ndim <= 1
-                ),
+                "params": (p for p in params if p.requires_grad and p.ndim <= 1),
                 "weight_decay": 0,
             },
         ]
@@ -302,7 +413,7 @@ class PLBeatThis(LightningModule):
         )
 
         result = dict(optimizer=optimizer)
-        result["lr_scheduler"] = {"scheduler": self.lr_scheduler, "interval": "step"}
+        result["lr_scheduler"] = {"scheduler": self.lr_scheduler, "interval": "step"}  # type: ignore
         return result
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
@@ -315,28 +426,6 @@ class PLBeatThis(LightningModule):
         # remove _orig_mod prefixes for compiled models
         state_dict = replace_state_dict_key(state_dict, "_orig_mod.", "")
         return state_dict
-
-
-class Metrics:
-    def __init__(self, eval_trim_beats: int) -> None:
-        self.min_beat_time = eval_trim_beats
-
-    def __call__(self, truth, preds, step) -> Any:
-        truth = mir_eval.beat.trim_beats(truth, min_beat_time=self.min_beat_time)
-        preds = mir_eval.beat.trim_beats(preds, min_beat_time=self.min_beat_time)
-        if (
-            step == "val"
-        ):  # limit the metrics that are computed during validation to speed up training
-            fmeasure = mir_eval.beat.f_measure(truth, preds)
-            cemgil = mir_eval.beat.cemgil(truth, preds)
-            return {"F-measure": fmeasure, "Cemgil": cemgil}
-        elif step == "test":  # compute all metrics during testing
-            CMLc, CMLt, AMLc, AMLt = mir_eval.beat.continuity(truth, preds)
-            fmeasure = mir_eval.beat.f_measure(truth, preds)
-            cemgil = mir_eval.beat.cemgil(truth, preds)
-            return {"F-measure": fmeasure, "Cemgil": cemgil, "CMLt": CMLt, "AMLt": AMLt}
-        else:
-            raise ValueError("step must be either val or test")
 
 
 class CosineWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):

@@ -2,17 +2,41 @@
 Model definitions for the Beat This! beat tracker.
 """
 
-import contextlib
 from collections import OrderedDict
+from dataclasses import dataclass
 
 import torch
+from torch import Tensor
 from einops import rearrange
 from einops.layers.torch import Rearrange
 from rotary_embedding_torch import RotaryEmbedding
 from torch import nn
 
+from beat_this.batchable_dataclass import BatchableDataclass
 from beat_this.model import roformer
+from beat_this.model.grid import GridOutput, WindowedGrid
+from beat_this.model.subgrid import BeatSubgrid, SubgridOutput
 from beat_this.utils import replace_state_dict_key
+
+
+@dataclass
+class ModelOutput(BatchableDataclass):
+    grid_features: Tensor
+    grid_activations: Tensor
+
+    grid_mask: Tensor
+
+    subgrid_features: Tensor
+
+    beat_activation: Tensor
+    beat_mask: Tensor
+
+    downbeat_activation: Tensor
+    downbeat_mask: Tensor
+
+    def get_masked_subgrid_features(self, index):
+        m = self.grid_mask[index]
+        return self.subgrid_features[index][m]
 
 
 class BeatThis(nn.Module):
@@ -44,10 +68,26 @@ class BeatThis(nn.Module):
         head_dim: int = 32,
         stem_dim: int = 32,
         dropout: dict = {"frontend": 0.1, "transformer": 0.2},
-        sum_head: bool = True,
         partial_transformers: bool = True,
+        # Grid stuff
+        grid_window_size: int = 50,
+        # 400 bpm means ~7 bps which means 7/50 ~= 1/7 beats per 20ms. max_freq=0.2 should be safe, it corresponds to 600 bpm
+        # that means min_freq is around 0.01 (1 peak per 2 seconds)
+        grid_min_freq: float = 0.01,
+        grid_bins_per_octave: int = 3,
+        grid_pred_prob_spread: float = 0.05,
+        grid_half_crossfade_frames: int = 4,
+        # Subgrid stuff
+        use_subgrid: bool = True,
+        subgrid_transformer_layers=3,
+        max_subgrid_meter: int = 4,
+        max_subgrid_downbeat_meter: int = 15,
+        # TESTING
+        kaiming_init_grid=True,
+        kaiming_grid_last_factor=0.01,
     ):
         super().__init__()
+        self.use_subgrid = use_subgrid
         # shared rotary embedding for frontend blocks and transformer blocks
         rotary_embed = RotaryEmbedding(head_dim)
 
@@ -80,10 +120,11 @@ class BeatThis(nn.Module):
         )
 
         # create the transformer blocks
-        assert (
-            transformer_dim % head_dim == 0
-        ), "transformer_dim must be divisible by head_dim"
+        assert transformer_dim % head_dim == 0, (
+            "transformer_dim must be divisible by head_dim"
+        )
         n_heads = transformer_dim // head_dim
+
         self.transformer_blocks = roformer.Transformer(
             dim=transformer_dim,
             depth=n_layers,
@@ -96,14 +137,42 @@ class BeatThis(nn.Module):
             norm_output=True,
         )
 
-        # create the output heads
-        if sum_head:
-            self.task_heads = SumHead(transformer_dim)
-        else:
-            self.task_heads = Head(transformer_dim)
+        # Create grid
+        self.grid_processor = WindowedGrid(
+            window_size=grid_window_size,
+            min_freq=grid_min_freq,
+            bins_per_octave=grid_bins_per_octave,
+            gradient_spread=grid_pred_prob_spread,
+            half_crossfade_frames=grid_half_crossfade_frames,
+        )
+
+        self.grid_block = GridBlock(
+            grid_processor=self.grid_processor,
+            input_channels=transformer_dim,
+        )
+
+        # Create subgrid
+        if use_subgrid:
+            # It is important that this is named something with subgrid because state-dict is filtered on the name later
+            self.subgrid_block = SubgridBlock(
+                max_beat_meter=max_subgrid_meter,
+                max_downbeat_meter=max_subgrid_downbeat_meter,
+                transformer_dim=transformer_dim,
+                n_layers=subgrid_transformer_layers,
+                dropout=dropout,
+                ff_mult=ff_mult,
+                head_dim=head_dim,
+                n_heads=n_heads,
+                rotary_embed=rotary_embed,
+            )
+
+            self.subgrid_processor = self.subgrid_block.subgrid_processor
 
         # init all weights
-        self.apply(self._init_weights)
+        with torch.no_grad():
+            self.apply(self._init_weights)
+            if kaiming_init_grid:
+                self.grid_block.init_weights(kaiming_grid_last_factor)
 
     @staticmethod
     def make_stem(spect_dim: int, stem_dim: int) -> nn.Module:
@@ -134,23 +203,24 @@ class BeatThis(nn.Module):
         rotary_embed: RotaryEmbedding | None = None,
         dropout: float = 0.1,
     ) -> nn.Module:
-        if partial_transformers and (head_dim is None or rotary_embed is None):
-            raise ValueError(
-                "Must specify head_dim and rotary_embed for using partial_transformers"
+        if partial_transformers:
+            if head_dim is None or rotary_embed is None:
+                raise ValueError(
+                    "Must specify head_dim and rotary_embed for using partial_transformers"
+                )
+            partial = PartialFTTransformer(
+                dim=in_dim,
+                dim_head=head_dim,
+                n_head=in_dim // head_dim,
+                rotary_embed=rotary_embed,
+                dropout=dropout,
             )
+        else:
+            partial = nn.Identity()
+
         return nn.Sequential(
             OrderedDict(
-                partial=(
-                    PartialFTTransformer(
-                        dim=in_dim,
-                        dim_head=head_dim,
-                        n_head=in_dim // head_dim,
-                        rotary_embed=rotary_embed,
-                        dropout=dropout,
-                    )
-                    if partial_transformers
-                    else nn.Identity()
-                ),
+                partial=partial,
                 # conv block
                 conv2d=nn.Conv2d(
                     in_channels=in_dim,
@@ -185,11 +255,83 @@ class BeatThis(nn.Module):
                 with torch.no_grad():
                     module.weight[module.padding_idx].fill_(0)
 
-    def forward(self, x):
-        x = self.frontend(x)
-        x = self.transformer_blocks(x)
-        x = self.task_heads(x)
-        return x
+    def pre_grid_forward(self, x: Tensor) -> Tensor:
+        x1 = self.frontend(x)
+        x2 = self.transformer_blocks(x1)
+
+        # if torch.any(torch.isnan(x1)):
+        #     print(f"{x.mean(dim=(1,2))=}")
+        #     print(f"{x.amin(dim=(1,2))=}")
+        #     print(f"{x.amax(dim=(1,2))=}")
+        #     print(f"{x1.mean(dim=(1,2))=}")
+        #     raise ValueError("nan after frontend")
+        # if torch.any(torch.isnan(x2)):
+        #     print(f"{x.mean(dim=(1,2))=}")
+        #     print(f"{x1.mean(dim=(1,2))=}")
+        #     print(f"{x2.mean(dim=(1,2))=}")
+        #     raise ValueError("nan after transformers")
+
+        return x2
+
+    def grid_forward(self, x: Tensor) -> GridOutput:
+        x1 = self.grid_block.forward(x)
+        # if x1.hasnan():
+        #     print(f"{x.mean(dim=(1,2))=}")
+        #     print(f"{x1.activation.mean(dim=(1))=}")
+        #     print(f"{x1.features.mean(dim=(1,2,3))=}")
+        #     print(f"{x1.mask.mean(dim=(1))=}")
+        #     raise ValueError("nan after grid_forward")
+        return x1
+
+    def subgrid_forward(self, signal: Tensor, grid: GridOutput) -> SubgridOutput:
+        x1 = self.subgrid_block.forward(
+            signal,
+            grid.mask,
+            grid.waves,
+        )
+
+        # if x1.hasnan():
+        #     print(f"{signal.mean(dim=(1,2))=}")
+        #     print(f"{grid.mask.sum(dim=1)=}")
+        #     print(f"{grid.waves.mean(dim=(1,2))=}")
+        #     print(f"{grid.activation.mean(dim=1)=}")
+        #     print(f"{x1.features.mean(dim=(1,2))=}")
+        #     print(f"{x1.b_activation.mean(dim=(1))=}")
+        #     print(f"{x1.beat_mask.sum(dim=(1))=}")
+        #     print(f"{x1.db_activation.mean(dim=(1))=}")
+        #     print(f"{x1.downbeat_mask.sum(dim=(1))=}")
+        #     raise ValueError("nan after subgrid_forward")
+        return x1
+
+    def forward(self, x, detach_pregrid=False) -> ModelOutput:
+        x = self.pre_grid_forward(x)
+        if detach_pregrid:
+            x = x.detach()
+        y = self.grid_forward(x)
+
+        if not self.use_subgrid:
+            return ModelOutput(
+                grid_features=y.features,
+                grid_activations=y.activation,
+                grid_mask=y.mask,
+                beat_mask=None,  # type: ignore
+                beat_activation=None,  # type: ignore
+                downbeat_mask=None,  # type: ignore
+                downbeat_activation=None,  # type: ignore
+                subgrid_features=None,  # type: ignore
+            )
+
+        z = self.subgrid_forward(x, y)
+        return ModelOutput(
+            grid_features=y.features,
+            grid_activations=y.activation,
+            grid_mask=y.mask,
+            beat_mask=z.beat_mask,
+            beat_activation=z.b_activation,
+            downbeat_activation=z.db_activation,
+            downbeat_mask=z.downbeat_mask,
+            subgrid_features=z.features,
+        )
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         # remove _orig_mod prefixes for compiled models
@@ -301,46 +443,126 @@ class PartialFTTransformer(nn.Module):
         return x
 
 
-class SumHead(nn.Module):
-    """
-    A PyTorch module that produces the final beat and downbeat prediction logits.
-    The beats are a sum of all beats and all downbeats predictions, to reduce the prediction
-    of downbeats which are not beats.
-    """
-
-    def __init__(self, input_dim):
+class GridBlock(nn.Module):
+    def __init__(
+        self,
+        grid_processor: WindowedGrid,
+        input_channels,
+        hidden_size=50,
+        n_layers=3,
+    ) -> None:
         super().__init__()
-        self.beat_downbeat_lin = nn.Linear(input_dim, 2)
+        self.window_size = grid_processor.window_size
+        self.grid_processor = grid_processor
+        r1 = Rearrange("b (w t) ch -> b w (t ch)", t=self.window_size)
+        r2 = Rearrange("b w (c three) -> b w c three", three=3)
 
-    def forward(self, x):
-        beat_downbeat = self.beat_downbeat_lin(x)
-        # separate beat from downbeat
-        beat, downbeat = rearrange(beat_downbeat, "b t c -> c b t", c=2)
-        # aggregate beats and downbeats prediction
-        # autocast to float16 disabled to avoid numerical issues causing NaNs
-        if hasattr(
-            torch.amp, "is_autocast_available"
-        ) and not torch.amp.is_autocast_available(beat.device.type):
-            # but do not try disabling if the device does not support autocast
-            disable_autocast = contextlib.nullcontext()
+        if n_layers == 1:
+            self.layers = nn.Sequential(
+                r1,
+                nn.Linear(
+                    self.window_size * input_channels,
+                    self.grid_processor.n_bins * 3,
+                ),
+                r2,
+                self.grid_processor,
+            )
+        elif n_layers > 1:
+            self.layers = nn.Sequential(
+                r1,
+                nn.Linear(
+                    self.window_size * input_channels,
+                    hidden_size,
+                ),
+                nn.GELU(),
+                *[
+                    nn.Sequential(
+                        nn.Linear(hidden_size, hidden_size),
+                        nn.GELU(),
+                    )
+                    for _ in range(n_layers - 2)
+                ],
+                nn.Linear(
+                    hidden_size,
+                    self.grid_processor.n_bins * 3,
+                ),
+                r2,
+                self.grid_processor,
+            )
         else:
-            disable_autocast = torch.autocast(beat.device.type, enabled=False)
-        with disable_autocast:
-            beat = beat.float() + downbeat.float()
-        return {"beat": beat, "downbeat": downbeat}
+            raise ValueError(f"{n_layers=} is not a valid number")
+
+    def init_weights(self, factor):
+        def _init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.kaiming_normal_(
+                    module.weight, mode="fan_in", nonlinearity="relu"
+                )
+                if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
+
+        self.apply(_init)
+        self.layers[-3].weight.mul_(factor)  # Final linear layer
+
+    def forward(self, x) -> GridOutput:
+        y = self.layers(x)
+        # y.activation has shape b t
+        return y
 
 
-class Head(nn.Module):
-    """
-    A PyToch module that produces the final beat and downbeat prediction logits with independent linear layers outputs.
-    """
-
-    def __init__(self, input_dim):
+class SubgridBlock(nn.Module):
+    def __init__(
+        self,
+        max_beat_meter,
+        max_downbeat_meter,
+        transformer_dim,
+        n_layers,
+        n_heads,
+        dropout,
+        rotary_embed,
+        ff_mult,
+        head_dim,
+    ) -> None:
         super().__init__()
-        self.beat_downbeat_lin = nn.Linear(input_dim, 2)
+        self.max_beat_meter = max_beat_meter
+        self.max_downbeat_meter = max_downbeat_meter
+        self.subgrid_processor = BeatSubgrid(
+            max_beat_meter,
+            max_downbeat_meter,
+        )
 
-    def forward(self, x):
-        beat_downbeat = self.beat_downbeat_lin(x)
-        # separate beat from downbeat
-        beat, downbeat = rearrange(beat_downbeat, "b t c -> c b t", c=2)
-        return {"beat": beat, "downbeat": downbeat}
+        self.grid_embedding = nn.Linear(3, transformer_dim, bias=False)
+        self.transformer = roformer.Transformer(
+            dim=transformer_dim,
+            depth=n_layers,
+            heads=n_heads,
+            attn_dropout=dropout["transformer"],
+            ff_dropout=dropout["transformer"],
+            rotary_embed=rotary_embed,
+            ff_mult=ff_mult,
+            dim_head=head_dim,
+            norm_output=True,
+        )
+
+        self.final_projection = nn.Linear(
+            transformer_dim, self.subgrid_processor.input_size
+        )
+
+    def forward(
+        self,
+        signal: torch.Tensor,  # B,T,C
+        mask: torch.Tensor,  # B,T
+        mask_waves: torch.Tensor,  # B,T,2
+    ) -> SubgridOutput:
+        # B,T,3
+        full_grid_signal = torch.concat((mask[..., None].float(), mask_waves), dim=-1)
+        # B,T,C
+        extra = self.grid_embedding(full_grid_signal)
+        # B,T,C
+        x = signal + extra
+        x = self.transformer(x)
+
+        x = self.final_projection(x)
+
+        y = self.subgrid_processor.forward(x, mask)
+        return y

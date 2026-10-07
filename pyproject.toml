@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "beat-this"
-version = "1.1.0"
+version = "0.1"
 description = "Beat This! beat tracker"
 readme = "README.md"
 classifiers = [
@@ -35,7 +35,6 @@ beat_this = "beat_this"
 [project.urls]
 Repository = "https://github.com/CPJKU/beat_this"
 Issues = "https://github.com/CPJKU/beat_this/issues"
-Changelog = "https://github.com/CPJKU/beat_this/blob/main/CHANGELOG.md"
 
 [project.scripts]
 beat_this = "beat_this.cli:main"

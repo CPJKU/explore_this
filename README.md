@@ -22,3 +22,16 @@ python launch_scripts/train.py --name=final_0 --logger=wandb --transformer-dim=2
 ## Implementation of the grid and subgrid
 This is the important part of this repository, and is what differs from Beat This. 
 ```beat_this/model/grid.py``` and ```beat_this/model/grid.py``` contain the majority of the logic for the modules, and the rest is either in files imported by those or in ```beat_this/model/beat_tracker.py``` (which chains together the modules) or ```beat_this/model/pl_module.py``` (where the losses are applied).
+
+## Cite
+
+```
+@inproceedings{explorethis,
+  author       = {Robert Kihlborg and
+                  André Holzapfel and
+                  Jan Schl{\"u}ter},
+  title        = {Explore This! Beat and Downbeat Tracking From a Learned Tatum Grid},
+  year         = {2026},
+  booktitle    = {Proceedings of the International Society for Music Information Retrieval Conference (ISMIR)},
+}
+```

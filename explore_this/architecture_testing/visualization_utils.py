@@ -1,15 +1,15 @@
 import matplotlib.pyplot as plt
 import torch
 
-from beat_this.metrics import mask_recall
-import beat_this.architecture_testing.listen as listen
-from beat_this.model.grid import GridOutput, WindowedGrid
-from beat_this.model.subgrid import BeatSubgrid
+from explore_this.metrics import mask_recall
+import explore_this.architecture_testing.listen as listen
+from explore_this.model.grid import GridOutput, WindowedGrid
+from explore_this.model.subgrid import BeatSubgrid
 
 from tqdm import tqdm
 
-from beat_this.model.beat_tracker import BeatThis, ModelOutput
-from beat_this.model.grid_space_embedding import get_state
+from explore_this.model.beat_tracker import ExploreThis, ModelOutput
+from explore_this.model.grid_space_embedding import get_state
 
 
 def plot_bins(
@@ -168,7 +168,9 @@ def compare_annotations_and_grid_predictions(
     plt.show()
 
 
-def compare_models(a: BeatThis, b: BeatThis, dataloader, n_batches=8) -> list[tuple]:
+def compare_models(
+    a: ExploreThis, b: ExploreThis, dataloader, n_batches=8
+) -> list[tuple]:
     evaluations = []
 
     for i, batch in tqdm(enumerate(dataloader)):

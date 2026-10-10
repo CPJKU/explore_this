@@ -7,5 +7,5 @@ checkpoints/
 lightning_logs/
 wandb/
 .vscode/
-beat_this.egg-info/
+explore_this.egg-info/
 build/

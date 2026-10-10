@@ -1,9 +1,9 @@
+import warnings
+
 import mir_eval.beat
+import numpy as np
 import torch
 from torch import Tensor
-import numpy as np
-
-import warnings
 
 
 def mask_recall(prediction: Tensor, target: Tensor, frame_leniency: int = 3) -> Tensor:

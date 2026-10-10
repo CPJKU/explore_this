@@ -3,9 +3,9 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "beat-this"
+name = "explore-this"
 version = "0.1"
-description = "Beat This! beat tracker"
+description = "Explore This! beat tracker"
 readme = "README.md"
 classifiers = [
     "Intended Audience :: Science/Research",
@@ -14,6 +14,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 authors = [
+    {name = "Robert Kihlborg", email = "robert.olsson.kihlborg@gmail.com"},
     {name = "Francesco Foscarin", email = "francesco.foscarin@jku.at"},
     {name = "Jan Schlüter", email = "jan.schlueter@jku.at"},
 ]
@@ -30,11 +31,9 @@ license = "MIT"
 license-files = ["LICENSE"]
 
 [tool.setuptools.package-dir]
-beat_this = "beat_this"
+explore_this = "explore_this"
 
 [project.urls]
-Repository = "https://github.com/CPJKU/beat_this"
-Issues = "https://github.com/CPJKU/beat_this/issues"
+Repository = "https://github.com/CPJKU/explore_this"
+Issues = "https://github.com/CPJKU/explore_this/issues"
 
-[project.scripts]
-beat_this = "beat_this.cli:main"

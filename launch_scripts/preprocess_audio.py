@@ -13,8 +13,8 @@ import torchaudio
 from pedalboard import Pedalboard, PitchShift, time_stretch
 from tqdm import tqdm
 
-from beat_this.dataset.augment import precomputed_augmentation_filenames
-from beat_this.preprocessing import LogMelSpect, load_audio
+from explore_this.dataset.augment import precomputed_augmentation_filenames
+from explore_this.preprocessing import LogMelSpect, load_audio
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
@@ -147,9 +147,9 @@ class SpectCreation:
                 if self.verbose:
                     print(f"Computing {spect_path}")
                 waveform, sr = load_audio(audio_path)
-                assert (
-                    sr == self.audio_sr
-                ), f"Sample rate mismatch: {sr} != {self.audio_sr}"
+                assert sr == self.audio_sr, (
+                    f"Sample rate mismatch: {sr} != {self.audio_sr}"
+                )
                 # compute the mel spectrogram and scale the values with log(1 + 1000 * x)
                 spect = self.logspect_class(torch.tensor(waveform, dtype=torch.float32))
                 # save the spectrogram as numpy array
@@ -443,7 +443,6 @@ def main(orig_audio_paths, pitch_shift, time_stretch, verbose):
 
 
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--orig_audio_paths",

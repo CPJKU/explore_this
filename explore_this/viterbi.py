@@ -1,9 +1,6 @@
 import torch
 
 
-import torch
-
-
 def viterbi(x: torch.Tensor, transitions: torch.Tensor):
     """
     x: (T, C) emission log probabilities

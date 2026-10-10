@@ -7,7 +7,7 @@ from typing import NamedTuple
 import librosa
 import soundfile as sf
 
-from beat_this.model.beat_tracker import ModelOutput
+from explore_this.model.beat_tracker import ModelOutput
 
 
 class MonoAudio(NamedTuple):

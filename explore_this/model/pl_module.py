@@ -1,5 +1,5 @@
 """
-Pytorch Lightning module, wraps a BeatThis model along with losses, metrics and
+Pytorch Lightning module, wraps a ExploreThis model along with losses, metrics and
 optimizers for training.
 """
 
@@ -10,24 +10,24 @@ import numpy as np
 import torch
 from pytorch_lightning import LightningModule
 
-from beat_this.model.grid import (
+from explore_this.model.grid import (
     WindowedGridRegularizationLoss,
     RecallLoss,
     LowProbLoss,
 )
 
-import beat_this.metrics as metrics
+import explore_this.metrics as metrics
 
-from beat_this.inference import split_predict_aggregate
-from beat_this.model.beat_tracker import BeatThis, ModelOutput
-from beat_this.model.subgrid import (
+from explore_this.inference import split_predict_aggregate
+from explore_this.model.beat_tracker import ExploreThis, ModelOutput
+from explore_this.model.subgrid import (
     BeatSubgridPredictionLoss,
     BeatSubgridRegularizationLoss,
 )
-from beat_this.utils import replace_state_dict_key
+from explore_this.utils import replace_state_dict_key
 
 
-class PLBeatThis(LightningModule):
+class PLExploreThis(LightningModule):
     def __init__(
         self,
         training_type: str,  # ["full", "grid", "subgrid"]
@@ -72,7 +72,7 @@ class PLBeatThis(LightningModule):
         self.fps = fps
         # create model
 
-        self.model = BeatThis(
+        self.model = ExploreThis(
             spect_dim=spect_dim,
             transformer_dim=transformer_dim,
             ff_mult=ff_mult,

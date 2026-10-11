@@ -1,22 +1,21 @@
 """
-Model definitions for the Beat This! beat tracker.
+Model definitions for the Explore This! beat tracker.
 """
 
 from collections import OrderedDict
 from dataclasses import dataclass
 
 import torch
-from torch import Tensor
 from einops import rearrange
 from einops.layers.torch import Rearrange
 from rotary_embedding_torch import RotaryEmbedding
-from torch import nn
+from torch import Tensor, nn
 
-from beat_this.batchable_dataclass import BatchableDataclass
-from beat_this.model import roformer
-from beat_this.model.grid import GridOutput, WindowedGrid
-from beat_this.model.subgrid import BeatSubgrid, SubgridOutput
-from beat_this.utils import replace_state_dict_key
+from explore_this.batchable_dataclass import BatchableDataclass
+from explore_this.model import roformer
+from explore_this.model.grid import GridOutput, WindowedGrid
+from explore_this.model.subgrid import BeatSubgrid, SubgridOutput
+from explore_this.utils import replace_state_dict_key
 
 
 @dataclass
@@ -39,7 +38,7 @@ class ModelOutput(BatchableDataclass):
         return self.subgrid_features[index][m]
 
 
-class BeatThis(nn.Module):
+class ExploreThis(nn.Module):
     """
     A neural network model for beat tracking. It is composed of three main components:
     - a frontend that processes the input spectrogram,
@@ -502,7 +501,7 @@ class GridBlock(nn.Module):
                     torch.nn.init.zeros_(module.bias)
 
         self.apply(_init)
-        self.layers[-3].weight.mul_(factor)  # Final linear layer
+        self.layers[-3].weight.mul_(factor)  # type: ignore # Final linear layer
 
     def forward(self, x) -> GridOutput:
         y = self.layers(x)

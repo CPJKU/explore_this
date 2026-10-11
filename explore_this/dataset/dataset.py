@@ -11,12 +11,12 @@ import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from beat_this.dataset.augment import (
+from explore_this.dataset.augment import (
     augment_mask_,
     augment_pitchtempo,
     precomputed_augmentation_filenames,
 )
-from beat_this.utils import index_to_framewise
+from explore_this.utils import index_to_framewise
 
 from .mmnpz import MemmappedNpzFile
 

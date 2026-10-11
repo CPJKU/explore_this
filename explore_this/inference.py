@@ -5,23 +5,20 @@ import soxr
 import torch
 import torch.nn.functional as F
 
-from beat_this.model.beat_tracker import BeatThis, ModelOutput
+from explore_this.model.beat_tracker import ExploreThis, ModelOutput
 
-# from beat_this.model.postprocessor import Postprocessor
-from beat_this.model.grid import GridOutput
-from beat_this.model.subgrid import SubgridOutput
-from beat_this.preprocessing import LogMelSpect, load_audio
-from beat_this.utils import replace_state_dict_key, save_beat_tsv
-
-CHECKPOINT_URL = "https://cloud.cp.jku.at/public.php/dav/files/7ik4RrBKTS273gp"
+from explore_this.model.grid import GridOutput
+from explore_this.model.subgrid import SubgridOutput
+from explore_this.preprocessing import LogMelSpect, load_audio
+from explore_this.utils import replace_state_dict_key, save_beat_tsv
 
 
 def load_checkpoint(checkpoint_path: str, device: str | torch.device = "cpu") -> dict:
     """
-    Load a BeatThis checkpoint as a dictionary.
+    Load a ExploreThis checkpoint as a dictionary.
 
     Args:
-        checkpoint_path (str, optional): The path to the checkpoint. Can be a local path, a URL, or a shortname.
+        checkpoint_path (str): The path to the checkpoint.
         device (torch.device or str): The device to load the model on.
 
     Returns:
@@ -32,42 +29,22 @@ def load_checkpoint(checkpoint_path: str, device: str | torch.device = "cpu") ->
         weights_only = {"weights_only": False} if torch.__version__ >= "2" else {}
         return torch.load(checkpoint_path, map_location=device, **weights_only)
     except FileNotFoundError:
-        try:
-            if not (
-                str(checkpoint_path).startswith("https://")
-                or str(checkpoint_path).startswith("http://")
-            ):
-                # interpret it as a name of one of our checkpoints
-                checkpoint_url = f"{CHECKPOINT_URL}/{checkpoint_path}.ckpt"
-                file_name = f"beat_this-{checkpoint_path}.ckpt"
-            else:
-                # try interpreting as a URL
-                checkpoint_url = checkpoint_path
-                file_name = None
-            return torch.hub.load_state_dict_from_url(
-                checkpoint_url,
-                file_name=file_name,
-                map_location=device,
-            )
-        except Exception:
-            raise ValueError(
-                "Could not load the checkpoint given the provided name",
-                checkpoint_path,
-            )
+        raise ValueError(
+            "Could not load the checkpoint given the provided name",
+            checkpoint_path,
+        )
 
 
-def load_model(
-    checkpoint_path: str | None = "final0", device: str | torch.device = "cpu"
-) -> BeatThis:
+def load_model(checkpoint_path: str, device: str | torch.device = "cpu") -> ExploreThis:
     """
-    Load a BeatThis model from a checkpoint.
+    Load a ExploreThis model from a checkpoint.
 
     Args:
-        checkpoint_path (str, optional): The path to the checkpoint. Can be a local path, a URL, or a shortname.
+        checkpoint_path (str): The path to the checkpoint.
         device (torch.device or str): The device to load the model on.
 
     Returns:
-        BeatThis: The loaded model.
+        ExploreThis: The loaded model.
     """
     if checkpoint_path is not None:
         checkpoint = load_checkpoint(checkpoint_path, device)
@@ -77,16 +54,16 @@ def load_model(
         hparams = {
             k: v
             for k, v in hparams.items()
-            if k in set(inspect.signature(BeatThis).parameters)
+            if k in set(inspect.signature(ExploreThis).parameters)
         }
         # Create the uninitialized model
-        model = BeatThis(**hparams)
-        # The PLBeatThis (LightningModule) state_dict contains the BeatThis
+        model = ExploreThis(**hparams)
+        # The PLExploreThis (LightningModule) state_dict contains the ExploreThis
         # state_dict under the "model." prefix; remove the prefix to load it
         state_dict = replace_state_dict_key(checkpoint["state_dict"], "model.", "")
         model.load_state_dict(state_dict)
     else:
-        model = BeatThis()
+        model = ExploreThis()
     return model.to(device).eval()
 
 
@@ -172,7 +149,7 @@ def split_predict_aggregate(
     spect: torch.Tensor,
     chunk_size: int,
     overlap_mode: str,
-    model: BeatThis,
+    model: ExploreThis,
     end_goal: str = "subgrid",  # grid or subgrid
 ) -> ModelOutput:
     """

@@ -4,10 +4,10 @@ from typing import Literal
 import torch
 from torch import Tensor, nn
 
-from beat_this.batchable_dataclass import BatchableDataclass
-from beat_this.model.grid_space_embedding import space_size, advance_index, is_hit
+from explore_this.batchable_dataclass import BatchableDataclass
+from explore_this.model.grid_space_embedding import space_size, advance_index, is_hit
 
-from beat_this.viterbi import viterbi
+from explore_this.viterbi import viterbi
 
 
 @dataclass

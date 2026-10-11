@@ -1,5 +1,5 @@
-from dataclasses import fields
 from abc import ABC
+from dataclasses import fields
 
 import torch
 

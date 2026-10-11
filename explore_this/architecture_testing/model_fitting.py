@@ -6,7 +6,9 @@ import torch
 from torch import Tensor, nn
 from tqdm import tqdm
 
-from beat_this.architecture_testing.artificial_data_generation import ArtificialDataset
+from explore_this.architecture_testing.artificial_data_generation import (
+    ArtificialDataset,
+)
 
 
 class DirectFeatureModel(nn.Module):

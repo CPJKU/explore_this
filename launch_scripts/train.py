@@ -6,8 +6,8 @@ from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 
-from beat_this.dataset import BeatDataModule
-from beat_this.model.pl_module import PLBeatThis
+from explore_this.dataset import BeatDataModule
+from explore_this.model.pl_module import PLExploreThis
 
 
 def main(args):
@@ -32,7 +32,7 @@ def main(args):
         else:
             wandb_args = {}
         logger = WandbLogger(
-            project="beat_this",
+            project="explore_this",
             name=f"{args.name} {params_str}".strip(),
             **wandb_args,  # type: ignore
         )
@@ -88,7 +88,7 @@ def main(args):
         "frontend": args.frontend_dropout,
         "transformer": args.transformer_dropout,
     }
-    pl_model = PLBeatThis(
+    pl_model = PLExploreThis(
         training_type=args.training_type,
         spect_dim=128,
         fps=50,

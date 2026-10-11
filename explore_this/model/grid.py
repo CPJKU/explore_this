@@ -5,7 +5,7 @@ import torch
 from einops import rearrange
 from torch import nn
 
-from beat_this.batchable_dataclass import BatchableDataclass
+from explore_this.batchable_dataclass import BatchableDataclass
 
 
 @dataclass

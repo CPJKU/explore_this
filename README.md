@@ -5,7 +5,7 @@ This is a fork of [Beat This!](https://github.com/CPJKU/beat_this).
 To run the code, follow the instructions for Beat This! about how to install all of the dependencies. 
 
 This is a slightly cleaned up version of the code that was used for our paper, though it should hopefully not affect reproducability. 
-If the cleaning accidentally broke something, the commit with hash 18906da44d2247b19829e0cf9a098bed6d42316f is the original. ¨
+If the cleaning accidentally broke something, the commit with hash 18906da44d2247b19829e0cf9a098bed6d42316f is the original.
 
 
 ## Training 

@@ -19,6 +19,10 @@ The full version were trained with (i=0,1,2)
 python launch_scripts/train.py --name=final_0 --logger=wandb --transformer-dim=256 --n-layers=3 --subgrid-transformer-layers=3 --grid-window-size=50 --subgrid-regularization-scale=0.1 --grid-regularization-weight=0.1 --grid-reg-phase-factor=3 --grid-reg-freq-scale=0.004 --subgrid-max-downbeat-meter=7 --subgrid-loss-scale=30 --no-val --seed=i
 ```
 
+## Trained models
+The weights for the cross validation and final models can be downloaded [here](https://cloud.cp.jku.at/index.php/s/wAkMA2T6NjxJjTo).  
+```notebooks/results.ipynb``` shows how the models can be loaded.  
+
 ## Implementation of the grid and subgrid
 This is the important part of this repository, and is what differs from Beat This. 
 ```explore_this/model/grid.py``` and ```explore_this/model/subgrid.py``` contain the majority of the logic for the modules, and the rest is either in files imported by those or in ```explore_this/model/beat_tracker.py``` (which chains together the modules) or ```explore_this/model/pl_module.py``` (where the losses are applied).

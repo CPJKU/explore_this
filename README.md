@@ -32,6 +32,11 @@ During developement, we played around with artificial data to test the isolated 
 
 In ```notebooks/results.ipynb```, we include the script that calculates all paper-referenced metrics on the different datasets using the models trained with the above scripts. We used this instead of the "compute_paper_metrics.py" used by Beat This as it simplifies analysis. 
 
+## License
+The code and the published model weights are released under the [MIT license](LICENSE). Note that some of the training files are fully copyrighted or under limited Creative Commons licenses, and it is up to the user to assess whether this may impact their use case.
+
+See https://github.com/CPJKU/beat_this/issues/18 for discussion on licensing of model weights.
+
 ## Cite
 ```
 @inproceedings{explorethis2026,
